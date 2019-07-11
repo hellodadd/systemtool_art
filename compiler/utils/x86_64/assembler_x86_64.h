@@ -19,14 +19,12 @@
 
 #include <vector>
 
-#include "base/arena_containers.h"
 #include "base/bit_utils.h"
 #include "base/macros.h"
 #include "constants_x86_64.h"
 #include "globals.h"
 #include "managed_register_x86_64.h"
 #include "offsets.h"
-#include "utils/array_ref.h"
 #include "utils/assembler.h"
 
 namespace art {
@@ -271,70 +269,42 @@ class Address : public Operand {
  * Class to handle constant area values.
  */
 class ConstantArea {
- public:
-  explicit ConstantArea(ArenaAllocator* arena) : buffer_(arena->Adapter(kArenaAllocAssembler)) {}
+  public:
+    ConstantArea() {}
 
-  // Add a double to the constant area, returning the offset into
-  // the constant area where the literal resides.
-  size_t AddDouble(double v);
+    // Add a double to the constant area, returning the offset into
+    // the constant area where the literal resides.
+    int AddDouble(double v);
 
-  // Add a float to the constant area, returning the offset into
-  // the constant area where the literal resides.
-  size_t AddFloat(float v);
+    // Add a float to the constant area, returning the offset into
+    // the constant area where the literal resides.
+    int AddFloat(float v);
 
-  // Add an int32_t to the constant area, returning the offset into
-  // the constant area where the literal resides.
-  size_t AddInt32(int32_t v);
+    // Add an int32_t to the constant area, returning the offset into
+    // the constant area where the literal resides.
+    int AddInt32(int32_t v);
 
-  // Add an int32_t to the end of the constant area, returning the offset into
-  // the constant area where the literal resides.
-  size_t AppendInt32(int32_t v);
+    // Add an int64_t to the constant area, returning the offset into
+    // the constant area where the literal resides.
+    int AddInt64(int64_t v);
 
-  // Add an int64_t to the constant area, returning the offset into
-  // the constant area where the literal resides.
-  size_t AddInt64(int64_t v);
+    int GetSize() const {
+      return buffer_.size() * elem_size_;
+    }
 
-  size_t GetSize() const {
-    return buffer_.size() * elem_size_;
-  }
+    const std::vector<int32_t>& GetBuffer() const {
+      return buffer_;
+    }
 
-  ArrayRef<const int32_t> GetBuffer() const {
-    return ArrayRef<const int32_t>(buffer_);
-  }
-
- private:
-  static constexpr size_t elem_size_ = sizeof(int32_t);
-  ArenaVector<int32_t> buffer_;
-};
-
-
-// This is equivalent to the Label class, used in a slightly different context. We
-// inherit the functionality of the Label class, but prevent unintended
-// derived-to-base conversions by making the base class private.
-class NearLabel : private Label {
- public:
-  NearLabel() : Label() {}
-
-  // Expose the Label routines that we need.
-  using Label::Position;
-  using Label::LinkPosition;
-  using Label::IsBound;
-  using Label::IsUnused;
-  using Label::IsLinked;
-
- private:
-  using Label::BindTo;
-  using Label::LinkTo;
-
-  friend class x86_64::X86_64Assembler;
-
-  DISALLOW_COPY_AND_ASSIGN(NearLabel);
+  private:
+    static constexpr size_t elem_size_ = sizeof(int32_t);
+    std::vector<int32_t> buffer_;
 };
 
 
 class X86_64Assembler FINAL : public Assembler {
  public:
-  explicit X86_64Assembler(ArenaAllocator* arena) : Assembler(arena), constant_area_(arena) {}
+  X86_64Assembler() {}
   virtual ~X86_64Assembler() {}
 
   /*
@@ -356,19 +326,15 @@ class X86_64Assembler FINAL : public Assembler {
   void movq(CpuRegister dst, CpuRegister src);
   void movl(CpuRegister dst, CpuRegister src);
 
-  void movntl(const Address& dst, CpuRegister src);
-  void movntq(const Address& dst, CpuRegister src);
-
   void movq(CpuRegister dst, const Address& src);
   void movl(CpuRegister dst, const Address& src);
   void movq(const Address& dst, CpuRegister src);
-  void movq(const Address& dst, const Immediate& imm);
+  void movq(const Address& dst, const Immediate& src);
   void movl(const Address& dst, CpuRegister src);
   void movl(const Address& dst, const Immediate& imm);
 
   void cmov(Condition c, CpuRegister dst, CpuRegister src);  // This is the 64b version.
   void cmov(Condition c, CpuRegister dst, CpuRegister src, bool is64bit);
-  void cmov(Condition c, CpuRegister dst, const Address& src, bool is64bit);
 
   void movzxb(CpuRegister dst, CpuRegister src);
   void movzxb(CpuRegister dst, const Address& src);
@@ -573,7 +539,6 @@ class X86_64Assembler FINAL : public Assembler {
 
   void imull(CpuRegister dst, CpuRegister src);
   void imull(CpuRegister reg, const Immediate& imm);
-  void imull(CpuRegister dst, CpuRegister src, const Immediate& imm);
   void imull(CpuRegister reg, const Address& address);
 
   void imulq(CpuRegister src);
@@ -619,13 +584,10 @@ class X86_64Assembler FINAL : public Assembler {
   void hlt();
 
   void j(Condition condition, Label* label);
-  void j(Condition condition, NearLabel* label);
-  void jrcxz(NearLabel* label);
 
   void jmp(CpuRegister reg);
   void jmp(const Address& address);
   void jmp(Label* label);
-  void jmp(NearLabel* label);
 
   X86_64Assembler* lock();
   void cmpxchgl(const Address& address, CpuRegister reg);
@@ -640,36 +602,7 @@ class X86_64Assembler FINAL : public Assembler {
   void bswapl(CpuRegister dst);
   void bswapq(CpuRegister dst);
 
-  void bsfl(CpuRegister dst, CpuRegister src);
-  void bsfl(CpuRegister dst, const Address& src);
-  void bsfq(CpuRegister dst, CpuRegister src);
-  void bsfq(CpuRegister dst, const Address& src);
-
-  void bsrl(CpuRegister dst, CpuRegister src);
-  void bsrl(CpuRegister dst, const Address& src);
-  void bsrq(CpuRegister dst, CpuRegister src);
-  void bsrq(CpuRegister dst, const Address& src);
-
-  void popcntl(CpuRegister dst, CpuRegister src);
-  void popcntl(CpuRegister dst, const Address& src);
-  void popcntq(CpuRegister dst, CpuRegister src);
-  void popcntq(CpuRegister dst, const Address& src);
-
-  void rorl(CpuRegister reg, const Immediate& imm);
-  void rorl(CpuRegister operand, CpuRegister shifter);
-  void roll(CpuRegister reg, const Immediate& imm);
-  void roll(CpuRegister operand, CpuRegister shifter);
-
-  void rorq(CpuRegister reg, const Immediate& imm);
-  void rorq(CpuRegister operand, CpuRegister shifter);
-  void rolq(CpuRegister reg, const Immediate& imm);
-  void rolq(CpuRegister operand, CpuRegister shifter);
-
   void repne_scasw();
-  void repe_cmpsw();
-  void repe_cmpsl();
-  void repe_cmpsq();
-  void rep_movsw();
 
   //
   // Macros for High-level operations.
@@ -692,11 +625,7 @@ class X86_64Assembler FINAL : public Assembler {
   //
   int PreferredLoopAlignment() { return 16; }
   void Align(int alignment, int offset);
-  void Bind(Label* label) OVERRIDE;
-  void Jump(Label* label) OVERRIDE {
-    jmp(label);
-  }
-  void Bind(NearLabel* label);
+  void Bind(Label* label);
 
   //
   // Overridden common assembler high-level functionality
@@ -740,7 +669,7 @@ class X86_64Assembler FINAL : public Assembler {
   void LoadRef(ManagedRegister dest, FrameOffset  src) OVERRIDE;
 
   void LoadRef(ManagedRegister dest, ManagedRegister base, MemberOffset offs,
-               bool unpoison_reference) OVERRIDE;
+               bool poison_reference) OVERRIDE;
 
   void LoadRawPtr(ManagedRegister dest, ManagedRegister base, Offset offs) OVERRIDE;
 
@@ -818,51 +747,25 @@ class X86_64Assembler FINAL : public Assembler {
 
   // Add a double to the constant area, returning the offset into
   // the constant area where the literal resides.
-  size_t AddDouble(double v) { return constant_area_.AddDouble(v); }
+  int AddDouble(double v) { return constant_area_.AddDouble(v); }
 
   // Add a float to the constant area, returning the offset into
   // the constant area where the literal resides.
-  size_t AddFloat(float v)   { return constant_area_.AddFloat(v); }
+  int AddFloat(float v)   { return constant_area_.AddFloat(v); }
 
   // Add an int32_t to the constant area, returning the offset into
   // the constant area where the literal resides.
-  size_t AddInt32(int32_t v) {
-    return constant_area_.AddInt32(v);
-  }
-
-  // Add an int32_t to the end of the constant area, returning the offset into
-  // the constant area where the literal resides.
-  size_t AppendInt32(int32_t v) {
-    return constant_area_.AppendInt32(v);
-  }
+  int AddInt32(int32_t v) { return constant_area_.AddInt32(v); }
 
   // Add an int64_t to the constant area, returning the offset into
   // the constant area where the literal resides.
-  size_t AddInt64(int64_t v) { return constant_area_.AddInt64(v); }
+  int AddInt64(int64_t v) { return constant_area_.AddInt64(v); }
 
   // Add the contents of the constant area to the assembler buffer.
   void AddConstantArea();
 
   // Is the constant area empty? Return true if there are no literals in the constant area.
   bool IsConstantAreaEmpty() const { return constant_area_.GetSize() == 0; }
-
-  // Return the current size of the constant area.
-  size_t ConstantAreaSize() const { return constant_area_.GetSize(); }
-
-  //
-  // Heap poisoning.
-  //
-
-  // Poison a heap reference contained in `reg`.
-  void PoisonHeapReference(CpuRegister reg) { negl(reg); }
-  // Unpoison a heap reference contained in `reg`.
-  void UnpoisonHeapReference(CpuRegister reg) { negl(reg); }
-  // Unpoison a heap reference contained in `reg` if heap poisoning is enabled.
-  void MaybeUnpoisonHeapReference(CpuRegister reg) {
-    if (kPoisonHeapReferences) {
-      UnpoisonHeapReference(reg);
-    }
-  }
 
  private:
   void EmitUint8(uint8_t value);
@@ -878,7 +781,7 @@ class X86_64Assembler FINAL : public Assembler {
   void EmitComplex(uint8_t rm, const Operand& operand, const Immediate& immediate);
   void EmitLabel(Label* label, int instruction_size);
   void EmitLabelLink(Label* label);
-  void EmitLabelLink(NearLabel* label);
+  void EmitNearLabelLink(Label* label);
 
   void EmitGenericShift(bool wide, int rm, CpuRegister reg, const Immediate& imm);
   void EmitGenericShift(bool wide, int rm, CpuRegister operand, CpuRegister shifter);

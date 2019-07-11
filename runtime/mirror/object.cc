@@ -47,7 +47,7 @@ class CopyReferenceFieldsWithReadBarrierVisitor {
       : dest_obj_(dest_obj) {}
 
   void operator()(Object* obj, MemberOffset offset, bool /* is_static */) const
-      ALWAYS_INLINE SHARED_REQUIRES(Locks::mutator_lock_) {
+      ALWAYS_INLINE SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     // GetFieldObject() contains a RB.
     Object* ref = obj->GetFieldObject<Object>(offset);
     // No WB here as a large object space does not have a card table
@@ -56,17 +56,12 @@ class CopyReferenceFieldsWithReadBarrierVisitor {
   }
 
   void operator()(mirror::Class* klass, mirror::Reference* ref) const
-      ALWAYS_INLINE SHARED_REQUIRES(Locks::mutator_lock_) {
+      ALWAYS_INLINE SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     // Copy java.lang.ref.Reference.referent which isn't visited in
     // Object::VisitReferences().
     DCHECK(klass->IsTypeOfReferenceClass());
     this->operator()(ref, mirror::Reference::ReferentOffset(), false);
   }
-
-  // Unused since we don't copy class native roots.
-  void VisitRootIfNonNull(mirror::CompressedReference<mirror::Object>* root ATTRIBUTE_UNUSED)
-      const {}
-  void VisitRoot(mirror::CompressedReference<mirror::Object>* root ATTRIBUTE_UNUSED) const {}
 
  private:
   Object* const dest_obj_;
@@ -85,7 +80,7 @@ Object* Object::CopyObject(Thread* self, mirror::Object* dest, mirror::Object* s
     // object above, copy references fields one by one again with a
     // RB. TODO: Optimize this later?
     CopyReferenceFieldsWithReadBarrierVisitor visitor(dest);
-    src->VisitReferences(visitor, visitor);
+    src->VisitReferences<true>(visitor, visitor);
   }
   gc::Heap* heap = Runtime::Current()->GetHeap();
   // Perform write barriers on copied object references.
@@ -107,12 +102,12 @@ Object* Object::CopyObject(Thread* self, mirror::Object* dest, mirror::Object* s
 // An allocation pre-fence visitor that copies the object.
 class CopyObjectVisitor {
  public:
-  CopyObjectVisitor(Thread* self, Handle<Object>* orig, size_t num_bytes)
+  explicit CopyObjectVisitor(Thread* self, Handle<Object>* orig, size_t num_bytes)
       : self_(self), orig_(orig), num_bytes_(num_bytes) {
   }
 
   void operator()(Object* obj, size_t usable_size ATTRIBUTE_UNUSED) const
-      SHARED_REQUIRES(Locks::mutator_lock_) {
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     Object::CopyObject(self_, obj, orig_->Get(), num_bytes_);
   }
 
@@ -191,7 +186,7 @@ int32_t Object::IdentityHashCode() const {
         break;
       }
       case LockWord::kFatLocked: {
-        // Already inflated, return the hash stored in the monitor.
+        // Already inflated, return the has stored in the monitor.
         Monitor* monitor = lw.FatLockMonitor();
         DCHECK(monitor != nullptr);
         return monitor->GetHashCode();
@@ -216,13 +211,15 @@ void Object::CheckFieldAssignmentImpl(MemberOffset field_offset, Object* new_val
     return;
   }
   for (Class* cur = c; cur != nullptr; cur = cur->GetSuperClass()) {
-    for (ArtField& field : cur->GetIFields()) {
+    ArtField* fields = cur->GetIFields();
+    for (size_t i = 0, count = cur->NumInstanceFields(); i < count; ++i) {
       StackHandleScope<1> hs(Thread::Current());
       Handle<Object> h_object(hs.NewHandle(new_value));
-      if (field.GetOffset().Int32Value() == field_offset.Int32Value()) {
-        CHECK_NE(field.GetTypeAsPrimitiveType(), Primitive::kPrimNot);
+      ArtField* field = &fields[i];
+      if (field->GetOffset().Int32Value() == field_offset.Int32Value()) {
+        CHECK_NE(field->GetTypeAsPrimitiveType(), Primitive::kPrimNot);
         // TODO: resolve the field type for moving GC.
-        mirror::Class* field_type = field.GetType<!kMovingCollector>();
+        mirror::Class* field_type = field->GetType<!kMovingCollector>();
         if (field_type != nullptr) {
           CHECK(field_type->IsAssignableFrom(new_value->GetClass()));
         }
@@ -235,11 +232,13 @@ void Object::CheckFieldAssignmentImpl(MemberOffset field_offset, Object* new_val
     return;
   }
   if (IsClass()) {
-    for (ArtField& field : AsClass()->GetSFields()) {
-      if (field.GetOffset().Int32Value() == field_offset.Int32Value()) {
-        CHECK_NE(field.GetTypeAsPrimitiveType(), Primitive::kPrimNot);
+    ArtField* fields = AsClass()->GetSFields();
+    for (size_t i = 0, count = AsClass()->NumStaticFields(); i < count; ++i) {
+      ArtField* field = &fields[i];
+      if (field->GetOffset().Int32Value() == field_offset.Int32Value()) {
+        CHECK_NE(field->GetTypeAsPrimitiveType(), Primitive::kPrimNot);
         // TODO: resolve the field type for moving GC.
-        mirror::Class* field_type = field.GetType<!kMovingCollector>();
+        mirror::Class* field_type = field->GetType<!kMovingCollector>();
         if (field_type != nullptr) {
           CHECK(field_type->IsAssignableFrom(new_value->GetClass()));
         }

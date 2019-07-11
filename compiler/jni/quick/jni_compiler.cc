@@ -22,7 +22,6 @@
 #include <fstream>
 
 #include "art_method.h"
-#include "base/arena_allocator.h"
 #include "base/logging.h"
 #include "base/macros.h"
 #include "calling_convention.h"
@@ -68,20 +67,14 @@ CompiledMethod* ArtJniCompileMethodInternal(CompilerDriver* driver,
   const bool is_synchronized = (access_flags & kAccSynchronized) != 0;
   const char* shorty = dex_file.GetMethodShorty(dex_file.GetMethodId(method_idx));
   InstructionSet instruction_set = driver->GetInstructionSet();
-  const InstructionSetFeatures* instruction_set_features = driver->GetInstructionSetFeatures();
   const bool is_64_bit_target = Is64BitInstructionSet(instruction_set);
-
-  ArenaPool pool;
-  ArenaAllocator arena(&pool);
-
   // Calling conventions used to iterate over parameters to method
   std::unique_ptr<JniCallingConvention> main_jni_conv(
-      JniCallingConvention::Create(&arena, is_static, is_synchronized, shorty, instruction_set));
+      JniCallingConvention::Create(is_static, is_synchronized, shorty, instruction_set));
   bool reference_return = main_jni_conv->IsReturnAReference();
 
   std::unique_ptr<ManagedRuntimeCallingConvention> mr_conv(
-      ManagedRuntimeCallingConvention::Create(
-          &arena, is_static, is_synchronized, shorty, instruction_set));
+      ManagedRuntimeCallingConvention::Create(is_static, is_synchronized, shorty, instruction_set));
 
   // Calling conventions to call into JNI method "end" possibly passing a returned reference, the
   //     method and the current thread.
@@ -96,13 +89,12 @@ CompiledMethod* ArtJniCompileMethodInternal(CompilerDriver* driver,
     jni_end_shorty = "V";
   }
 
-  std::unique_ptr<JniCallingConvention> end_jni_conv(JniCallingConvention::Create(
-      &arena, is_static, is_synchronized, jni_end_shorty, instruction_set));
+  std::unique_ptr<JniCallingConvention> end_jni_conv(
+      JniCallingConvention::Create(is_static, is_synchronized, jni_end_shorty, instruction_set));
 
   // Assembler that holds generated instructions
-  std::unique_ptr<Assembler> jni_asm(
-      Assembler::Create(&arena, instruction_set, instruction_set_features));
-  jni_asm->cfi().SetEnabled(driver->GetCompilerOptions().GenerateAnyDebugInfo());
+  std::unique_ptr<Assembler> jni_asm(Assembler::Create(instruction_set));
+  jni_asm->cfi().SetEnabled(driver->GetCompilerOptions().GetGenerateDebugInfo());
 
   // Offsets into data structures
   // TODO: if cross compiling these offsets are for the host not the target
@@ -146,7 +138,7 @@ CompiledMethod* ArtJniCompileMethodInternal(CompilerDriver* driver,
     FrameOffset handle_scope_offset = main_jni_conv->CurrentParamHandleScopeEntryOffset();
     // Check handle scope offset is within frame
     CHECK_LT(handle_scope_offset.Uint32Value(), frame_size);
-    // Note this LoadRef() doesn't need heap unpoisoning since it's from the ArtMethod.
+    // Note this LoadRef() doesn't need heap poisoning since its from the ArtMethod.
     // Note this LoadRef() does not include read barrier. It will be handled below.
     __ LoadRef(main_jni_conv->InterproceduralScratchRegister(),
                mr_conv->MethodRegister(), ArtMethod::DeclaringClassOffset(), false);
@@ -482,7 +474,7 @@ CompiledMethod* ArtJniCompileMethodInternal(CompilerDriver* driver,
   DCHECK_EQ(jni_asm->cfi().GetCurrentCFAOffset(), static_cast<int>(frame_size));
 
   // 17. Finalize code generation
-  __ FinalizeCode();
+  __ EmitSlowPaths();
   size_t cs = __ CodeSize();
   std::vector<uint8_t> managed_code(cs);
   MemoryRegion code(&managed_code[0], managed_code.size());
@@ -494,9 +486,10 @@ CompiledMethod* ArtJniCompileMethodInternal(CompilerDriver* driver,
                                                  frame_size,
                                                  main_jni_conv->CoreSpillMask(),
                                                  main_jni_conv->FpSpillMask(),
-                                                 ArrayRef<const uint32_t>(), // called_methods.
-                                                 ArrayRef<const SrcMapElem>(),
+                                                 nullptr,  // src_mapping_table.
+                                                 ArrayRef<const uint8_t>(),  // mapping_table.
                                                  ArrayRef<const uint8_t>(),  // vmap_table.
+                                                 ArrayRef<const uint8_t>(),  // native_gc_map.
                                                  ArrayRef<const uint8_t>(*jni_asm->cfi().data()),
                                                  ArrayRef<const LinkerPatch>());
 }

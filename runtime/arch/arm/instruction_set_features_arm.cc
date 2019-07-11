@@ -16,7 +16,7 @@
 
 #include "instruction_set_features_arm.h"
 
-#if defined(__ANDROID__) && defined(__arm__)
+#if defined(HAVE_ANDROID_OS) && defined(__arm__)
 #include <sys/auxv.h>
 #include <asm/hwcap.h>
 #endif
@@ -88,7 +88,7 @@ const ArmInstructionSetFeatures* ArmInstructionSetFeatures::FromVariant(
         "arm1136j-s", "arm1136jf-s",
         "arm1156t2-s", "arm1156t2f-s", "arm1176jz-s", "arm1176jzf-s",
         "cortex-a5", "cortex-a8", "cortex-a9", "cortex-a9-mp", "cortex-r4f",
-        "marvell-pj4", "mpcore", "mpcorenovfp"
+        "marvell-pj4", "mpcore", "mpcorenovfp", "scorpion"
     };
     if (!FindVariantInArray(arm_variants_without_known_features,
                             arraysize(arm_variants_without_known_features),
@@ -166,7 +166,7 @@ const ArmInstructionSetFeatures* ArmInstructionSetFeatures::FromHwcap() {
   bool has_div = false;
   bool has_lpae = false;
 
-#if defined(__ANDROID__) && defined(__arm__)
+#if defined(HAVE_ANDROID_OS) && defined(__arm__)
   uint64_t hwcaps = getauxval(AT_HWCAP);
   LOG(INFO) << "hwcaps=" << hwcaps;
   if ((hwcaps & HWCAP_IDIVT) != 0) {

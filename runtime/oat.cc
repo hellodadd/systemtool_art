@@ -22,6 +22,10 @@
 #include "arch/instruction_set_features.h"
 #include "base/bit_utils.h"
 #include "base/stringprintf.h"
+#include "base/unix_file/fd_file.h"
+#include "elf_file.h"
+#include "oat_file.h"
+#include "os.h"
 
 namespace art {
 
@@ -45,7 +49,9 @@ static size_t ComputeOatHeaderSize(const SafeMap<std::string, std::string>* vari
 
 OatHeader* OatHeader::Create(InstructionSet instruction_set,
                              const InstructionSetFeatures* instruction_set_features,
-                             uint32_t dex_file_count,
+                             const std::vector<const DexFile*>* dex_files,
+                             uint32_t image_file_location_oat_checksum,
+                             uint32_t image_file_location_oat_data_begin,
                              const SafeMap<std::string, std::string>* variable_data) {
   // Estimate size of optional data.
   size_t needed_size = ComputeOatHeaderSize(variable_data);
@@ -56,29 +62,41 @@ OatHeader* OatHeader::Create(InstructionSet instruction_set,
   // Create the OatHeader in-place.
   return new (memory) OatHeader(instruction_set,
                                 instruction_set_features,
-                                dex_file_count,
+                                dex_files,
+                                image_file_location_oat_checksum,
+                                image_file_location_oat_data_begin,
                                 variable_data);
+}
+
+OatHeader* OatHeader::FromFile(const std::string& filename, std::string* error_msg) {
+  std::unique_ptr<File> file(OS::OpenFileForReading(filename.c_str()));
+  if (file.get() == nullptr) {
+    *error_msg = StringPrintf("Could not get oat header because file could not be opened: %s", filename.c_str());
+    return nullptr;
+  }
+  std::unique_ptr<ElfFile> elf_file(ElfFile::Open(file.get(), false, false, error_msg));
+  if (elf_file.get() == nullptr) {
+    return nullptr;
+  }
+  std::unique_ptr<OatFile> oat_file(OatFile::OpenWithElfFile(elf_file.release(), filename, nullptr, error_msg));
+  if (oat_file.get() == nullptr) {
+    return nullptr;
+  }
+
+  const OatHeader& oat_header = oat_file->GetOatHeader();
+  size_t header_size = oat_header.GetHeaderSize();
+  void* memory = operator new (header_size);
+  std::unique_ptr<OatHeader> hdr(new (memory) OatHeader());
+  memcpy(hdr.get(), &oat_header, header_size);
+  return hdr.release();
 }
 
 OatHeader::OatHeader(InstructionSet instruction_set,
                      const InstructionSetFeatures* instruction_set_features,
-                     uint32_t dex_file_count,
-                     const SafeMap<std::string, std::string>* variable_data)
-    : adler32_checksum_(adler32(0L, Z_NULL, 0)),
-      instruction_set_(instruction_set),
-      instruction_set_features_bitmap_(instruction_set_features->AsBitmap()),
-      dex_file_count_(dex_file_count),
-      executable_offset_(0),
-      interpreter_to_interpreter_bridge_offset_(0),
-      interpreter_to_compiled_code_bridge_offset_(0),
-      jni_dlsym_lookup_offset_(0),
-      quick_generic_jni_trampoline_offset_(0),
-      quick_imt_conflict_trampoline_offset_(0),
-      quick_resolution_trampoline_offset_(0),
-      quick_to_interpreter_bridge_offset_(0),
-      image_patch_delta_(0),
-      image_file_location_oat_checksum_(0),
-      image_file_location_oat_data_begin_(0) {
+                     const std::vector<const DexFile*>* dex_files,
+                     uint32_t image_file_location_oat_checksum,
+                     uint32_t image_file_location_oat_data_begin,
+                     const SafeMap<std::string, std::string>* variable_data) {
   // Don't want asserts in header as they would be checked in each file that includes it. But the
   // fields are private, so we check inside a method.
   static_assert(sizeof(magic_) == sizeof(kOatMagic),
@@ -88,11 +106,46 @@ OatHeader::OatHeader(InstructionSet instruction_set,
 
   memcpy(magic_, kOatMagic, sizeof(kOatMagic));
   memcpy(version_, kOatVersion, sizeof(kOatVersion));
+  executable_offset_ = 0;
+  image_patch_delta_ = 0;
+
+  adler32_checksum_ = adler32(0L, Z_NULL, 0);
 
   CHECK_NE(instruction_set, kNone);
+  instruction_set_ = instruction_set;
+  UpdateChecksum(&instruction_set_, sizeof(instruction_set_));
+
+  instruction_set_features_bitmap_ = instruction_set_features->AsBitmap();
+  UpdateChecksum(&instruction_set_features_bitmap_, sizeof(instruction_set_features_bitmap_));
+
+  dex_file_count_ = dex_files->size();
+  UpdateChecksum(&dex_file_count_, sizeof(dex_file_count_));
+
+  image_file_location_oat_checksum_ = image_file_location_oat_checksum;
+  UpdateChecksum(&image_file_location_oat_checksum_, sizeof(image_file_location_oat_checksum_));
+
+  CHECK(IsAligned<kPageSize>(image_file_location_oat_data_begin));
+  image_file_location_oat_data_begin_ = image_file_location_oat_data_begin;
+  UpdateChecksum(&image_file_location_oat_data_begin_, sizeof(image_file_location_oat_data_begin_));
 
   // Flatten the map. Will also update variable_size_data_size_.
   Flatten(variable_data);
+
+  // Update checksum for variable data size.
+  UpdateChecksum(&key_value_store_size_, sizeof(key_value_store_size_));
+
+  // Update for data, if existing.
+  if (key_value_store_size_ > 0U) {
+    UpdateChecksum(&key_value_store_, key_value_store_size_);
+  }
+
+  interpreter_to_interpreter_bridge_offset_ = 0;
+  interpreter_to_compiled_code_bridge_offset_ = 0;
+  jni_dlsym_lookup_offset_ = 0;
+  quick_generic_jni_trampoline_offset_ = 0;
+  quick_imt_conflict_trampoline_offset_ = 0;
+  quick_resolution_trampoline_offset_ = 0;
+  quick_to_interpreter_bridge_offset_ = 0;
 }
 
 bool OatHeader::IsValid() const {
@@ -106,9 +159,6 @@ bool OatHeader::IsValid() const {
     return false;
   }
   if (!IsAligned<kPageSize>(image_patch_delta_)) {
-    return false;
-  }
-  if (!IsValidInstructionSet(instruction_set_)) {
     return false;
   }
   return true;
@@ -133,10 +183,13 @@ std::string OatHeader::GetValidationErrorMessage() const {
   if (!IsAligned<kPageSize>(image_patch_delta_)) {
     return "Image patch delta not page-aligned.";
   }
-  if (!IsValidInstructionSet(instruction_set_)) {
-    return StringPrintf("Invalid instruction set, %d.", static_cast<int>(instruction_set_));
-  }
   return "";
+}
+
+bool OatHeader::IsXposedOatVersionValid() const {
+  CHECK(IsValid());
+  const char* version = GetStoreValueByKey(OatHeader::kXposedOatVersionKey);
+  return version != nullptr && strcmp(version, kXposedOatCurrentVersion) == 0;
 }
 
 const char* OatHeader::GetMagic() const {
@@ -149,45 +202,22 @@ uint32_t OatHeader::GetChecksum() const {
   return adler32_checksum_;
 }
 
-void OatHeader::UpdateChecksumWithHeaderData() {
-  UpdateChecksum(&instruction_set_, sizeof(instruction_set_));
-  UpdateChecksum(&instruction_set_features_bitmap_, sizeof(instruction_set_features_bitmap_));
-  UpdateChecksum(&dex_file_count_, sizeof(dex_file_count_));
-  UpdateChecksum(&image_file_location_oat_checksum_, sizeof(image_file_location_oat_checksum_));
-  UpdateChecksum(&image_file_location_oat_data_begin_, sizeof(image_file_location_oat_data_begin_));
-
-  // Update checksum for variable data size.
-  UpdateChecksum(&key_value_store_size_, sizeof(key_value_store_size_));
-
-  // Update for data, if existing.
-  if (key_value_store_size_ > 0U) {
-    UpdateChecksum(&key_value_store_, key_value_store_size_);
+uint32_t OatHeader::GetOriginalChecksum(bool fallback) const {
+  CHECK(IsValid());
+  const char* value = GetStoreValueByKey(OatHeader::kXposedOriginalChecksumKey);
+  if (value != nullptr) {
+    uint32_t checksum = strtoul(value, nullptr, 0);
+    if (checksum != 0) {
+      return checksum;
+    }
   }
-
-  UpdateChecksum(&executable_offset_, sizeof(executable_offset_));
-  UpdateChecksum(&interpreter_to_interpreter_bridge_offset_,
-                 sizeof(interpreter_to_interpreter_bridge_offset_));
-  UpdateChecksum(&interpreter_to_compiled_code_bridge_offset_,
-                 sizeof(interpreter_to_compiled_code_bridge_offset_));
-  UpdateChecksum(&jni_dlsym_lookup_offset_, sizeof(jni_dlsym_lookup_offset_));
-  UpdateChecksum(&quick_generic_jni_trampoline_offset_,
-                 sizeof(quick_generic_jni_trampoline_offset_));
-  UpdateChecksum(&quick_imt_conflict_trampoline_offset_,
-                 sizeof(quick_imt_conflict_trampoline_offset_));
-  UpdateChecksum(&quick_resolution_trampoline_offset_,
-                 sizeof(quick_resolution_trampoline_offset_));
-  UpdateChecksum(&quick_to_interpreter_bridge_offset_,
-                 sizeof(quick_to_interpreter_bridge_offset_));
+  return fallback ? adler32_checksum_ : 0;
 }
 
 void OatHeader::UpdateChecksum(const void* data, size_t length) {
   DCHECK(IsValid());
-  if (data != nullptr) {
-    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
-    adler32_checksum_ = adler32(adler32_checksum_, bytes, length);
-  } else {
-    DCHECK_EQ(0U, length);
-  }
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
+  adler32_checksum_ = adler32(adler32_checksum_, bytes, length);
 }
 
 InstructionSet OatHeader::GetInstructionSet() const {
@@ -214,6 +244,7 @@ void OatHeader::SetExecutableOffset(uint32_t executable_offset) {
   DCHECK_EQ(executable_offset_, 0U);
 
   executable_offset_ = executable_offset;
+  UpdateChecksum(&executable_offset_, sizeof(executable_offset));
 }
 
 const void* OatHeader::GetInterpreterToInterpreterBridge() const {
@@ -233,6 +264,7 @@ void OatHeader::SetInterpreterToInterpreterBridgeOffset(uint32_t offset) {
   DCHECK_EQ(interpreter_to_interpreter_bridge_offset_, 0U) << offset;
 
   interpreter_to_interpreter_bridge_offset_ = offset;
+  UpdateChecksum(&interpreter_to_interpreter_bridge_offset_, sizeof(offset));
 }
 
 const void* OatHeader::GetInterpreterToCompiledCodeBridge() const {
@@ -251,6 +283,7 @@ void OatHeader::SetInterpreterToCompiledCodeBridgeOffset(uint32_t offset) {
   DCHECK_EQ(interpreter_to_compiled_code_bridge_offset_, 0U) << offset;
 
   interpreter_to_compiled_code_bridge_offset_ = offset;
+  UpdateChecksum(&interpreter_to_compiled_code_bridge_offset_, sizeof(offset));
 }
 
 const void* OatHeader::GetJniDlsymLookup() const {
@@ -269,6 +302,7 @@ void OatHeader::SetJniDlsymLookupOffset(uint32_t offset) {
   DCHECK_EQ(jni_dlsym_lookup_offset_, 0U) << offset;
 
   jni_dlsym_lookup_offset_ = offset;
+  UpdateChecksum(&jni_dlsym_lookup_offset_, sizeof(offset));
 }
 
 const void* OatHeader::GetQuickGenericJniTrampoline() const {
@@ -287,6 +321,7 @@ void OatHeader::SetQuickGenericJniTrampolineOffset(uint32_t offset) {
   DCHECK_EQ(quick_generic_jni_trampoline_offset_, 0U) << offset;
 
   quick_generic_jni_trampoline_offset_ = offset;
+  UpdateChecksum(&quick_generic_jni_trampoline_offset_, sizeof(offset));
 }
 
 const void* OatHeader::GetQuickImtConflictTrampoline() const {
@@ -305,6 +340,7 @@ void OatHeader::SetQuickImtConflictTrampolineOffset(uint32_t offset) {
   DCHECK_EQ(quick_imt_conflict_trampoline_offset_, 0U) << offset;
 
   quick_imt_conflict_trampoline_offset_ = offset;
+  UpdateChecksum(&quick_imt_conflict_trampoline_offset_, sizeof(offset));
 }
 
 const void* OatHeader::GetQuickResolutionTrampoline() const {
@@ -323,6 +359,7 @@ void OatHeader::SetQuickResolutionTrampolineOffset(uint32_t offset) {
   DCHECK_EQ(quick_resolution_trampoline_offset_, 0U) << offset;
 
   quick_resolution_trampoline_offset_ = offset;
+  UpdateChecksum(&quick_resolution_trampoline_offset_, sizeof(offset));
 }
 
 const void* OatHeader::GetQuickToInterpreterBridge() const {
@@ -341,6 +378,7 @@ void OatHeader::SetQuickToInterpreterBridgeOffset(uint32_t offset) {
   DCHECK_EQ(quick_to_interpreter_bridge_offset_, 0U) << offset;
 
   quick_to_interpreter_bridge_offset_ = offset;
+  UpdateChecksum(&quick_to_interpreter_bridge_offset_, sizeof(offset));
 }
 
 int32_t OatHeader::GetImagePatchDelta() const {
@@ -368,20 +406,9 @@ uint32_t OatHeader::GetImageFileLocationOatChecksum() const {
   return image_file_location_oat_checksum_;
 }
 
-void OatHeader::SetImageFileLocationOatChecksum(uint32_t image_file_location_oat_checksum) {
-  CHECK(IsValid());
-  image_file_location_oat_checksum_ = image_file_location_oat_checksum;
-}
-
 uint32_t OatHeader::GetImageFileLocationOatDataBegin() const {
   CHECK(IsValid());
   return image_file_location_oat_data_begin_;
-}
-
-void OatHeader::SetImageFileLocationOatDataBegin(uint32_t image_file_location_oat_data_begin) {
-  CHECK(IsValid());
-  CHECK_ALIGNED(image_file_location_oat_data_begin, kPageSize);
-  image_file_location_oat_data_begin_ = image_file_location_oat_data_begin;
 }
 
 uint32_t OatHeader::GetKeyValueStoreSize() const {
@@ -466,34 +493,13 @@ bool OatHeader::IsPic() const {
   return IsKeyEnabled(OatHeader::kPicKey);
 }
 
-bool OatHeader::HasPatchInfo() const {
-  return IsKeyEnabled(OatHeader::kHasPatchInfoKey);
-}
-
 bool OatHeader::IsDebuggable() const {
   return IsKeyEnabled(OatHeader::kDebuggableKey);
 }
 
-bool OatHeader::IsNativeDebuggable() const {
-  return IsKeyEnabled(OatHeader::kNativeDebuggableKey);
-}
-
-CompilerFilter::Filter OatHeader::GetCompilerFilter() const {
-  CompilerFilter::Filter filter;
-  const char* key_value = GetStoreValueByKey(kCompilerFilter);
-  CHECK(key_value != nullptr) << "compiler-filter not found in oat header";
-  CHECK(CompilerFilter::ParseCompilerFilter(key_value, &filter))
-      << "Invalid compiler-filter in oat header: " << key_value;
-  return filter;
-}
-
-bool OatHeader::KeyHasValue(const char* key, const char* value, size_t value_size) const {
-  const char* key_value = GetStoreValueByKey(key);
-  return (key_value != nullptr && strncmp(key_value, value, value_size) == 0);
-}
-
 bool OatHeader::IsKeyEnabled(const char* key) const {
-  return KeyHasValue(key, kTrueValue, sizeof(kTrueValue));
+  const char* key_value = GetStoreValueByKey(key);
+  return (key_value != nullptr && strncmp(key_value, kTrueValue, sizeof(kTrueValue)) == 0);
 }
 
 void OatHeader::Flatten(const SafeMap<std::string, std::string>* key_value_store) {
@@ -515,5 +521,16 @@ OatMethodOffsets::OatMethodOffsets(uint32_t code_offset) : code_offset_(code_off
 }
 
 OatMethodOffsets::~OatMethodOffsets() {}
+
+OatQuickMethodHeader::OatQuickMethodHeader(
+    uint32_t mapping_table_offset, uint32_t vmap_table_offset, uint32_t gc_map_offset,
+    uint32_t frame_size_in_bytes, uint32_t core_spill_mask, uint32_t fp_spill_mask,
+    uint32_t code_size)
+    : mapping_table_offset_(mapping_table_offset), vmap_table_offset_(vmap_table_offset),
+      gc_map_offset_(gc_map_offset),
+      frame_info_(frame_size_in_bytes, core_spill_mask, fp_spill_mask), code_size_(code_size) {
+}
+
+OatQuickMethodHeader::~OatQuickMethodHeader() {}
 
 }  // namespace art
