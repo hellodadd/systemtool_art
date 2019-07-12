@@ -251,7 +251,7 @@ void LogMessage::LogLine(const char* file, unsigned int line, LogSeverity log_se
   const char* tag = ProgramInvocationShortName();
   int priority = kLogSeverityToAndroidLogPriority[log_severity];
   if (log_severity >= XPOSED_VERBOSE && log_severity <= XPOSED_FATAL) {
-    tag = "Xposed";
+    tag = "android";
   }
   if (priority == ANDROID_LOG_FATAL) {
     LOG_PRI(priority, tag, "%s:%u] %s", file, line, message);
